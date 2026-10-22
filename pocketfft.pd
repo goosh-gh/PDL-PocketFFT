@@ -1,0 +1,435 @@
+# pocketfft.pd — PDL::PP definitions of PDL::PocketFFT: one-dimensional complex and
+# real FFTs along dim 0 (broadcasting over the other dims), computed by the
+# pocketfft C library (Martin Reinecke, 3-clause BSD, bundled as pocketfft_lib.c).
+
+use strict;
+use warnings;
+
+our $VERSION = '0.001';
+pp_setversion($VERSION);
+
+pp_addhdr(<<'EOH');
+#include <complex.h>
+#include <stdlib.h>
+#include "pocketfft.h"
+EOH
+
+pp_export_nothing();
+
+pp_addpm({At => 'Top'}, <<'EOD');
+use strict;
+use warnings;
+use Carp ();
+
+=encoding utf8
+
+=head1 NAME
+
+PDL::PocketFFT - FFT of any length for PDL, by the bundled pocketfft C library
+
+=head1 SYNOPSIS
+
+    use PDL;
+    use PDL::PocketFFT qw(cfft icfft rfft irfft fft_inplace ifft_inplace);
+
+    my $Z  = cfft($z);              # complex input, dims (n, ...)
+    my $z2 = icfft($Z);             # inverse, scaled by 1/n
+    my $X  = rfft($x);              # real input (n, ...) -> complex (n/2+1, ...)
+    my $x2 = irfft($X, $x->dim(0)); # back to real, scaled by 1/n
+
+    fft_inplace($re, $im);          # the conventions of PDL::FFT::fft / ifft
+    ifft_inplace($re, $im);
+
+=head1 DESCRIPTION
+
+One-dimensional FFTs along dim 0, broadcasting over the other dims. The
+transforms are computed by pocketfft (C version, Martin Reinecke,
+Max-Planck-Society, 3-clause BSD), which is bundled with this module, so no
+external library is needed.
+
+Any length works. Lengths with large prime factors use Bluestein's algorithm,
+so every length costs O(n log n).
+
+All computation is in double precision; other input types are converted.
+
+Sign and scaling follow PDL::FFT and PDL::FFTW3: the forward transform is
+C<X[k] = sum_t x[t] exp(-2 pi i k t / n)>, unscaled, and the inverse
+transforms are scaled by 1/n.
+
+=head1 FUNCTIONS
+
+=cut
+
+EOD
+
+pp_def('cfft',
+    Pars => 'x(n); [o] y(n);',
+    GenericTypes => ['CD'],
+    Inplace => 1,
+    Code => q{
+        size_t len = $SIZE(n);
+        if (len == 0) $CROAK("cfft: length 0");
+        cfft_plan plan = make_cfft_plan(len);
+        double *buf = (double *)malloc(2 * len * sizeof(double));
+        if (!plan || !buf) {
+            if (plan) destroy_cfft_plan(plan);
+            free(buf);
+            $CROAK("cfft: out of memory (length %td)", (ptrdiff_t)len);
+        }
+        int failed = 0;
+        broadcastloop %{
+            if (!failed) {
+                loop(n) %{ buf[2*n] = creal($x()); buf[2*n+1] = cimag($x()); %}
+                if (cfft_forward(plan, buf, 1.0) != 0) failed = 1;
+                else { loop(n) %{ $y() = buf[2*n] + I * buf[2*n+1]; %} }
+            }
+        %}
+        destroy_cfft_plan(plan);
+        free(buf);
+        if (failed) $CROAK("cfft: pocketfft failed (out of memory)");
+    },
+    Doc => <<'EOD',
+=for ref
+
+Forward complex FFT along dim 0, unscaled. Can be used inplace.
+
+    $Z = cfft($z);
+EOD
+);
+
+pp_def('icfft',
+    Pars => 'x(n); [o] y(n);',
+    GenericTypes => ['CD'],
+    Inplace => 1,
+    Code => q{
+        size_t len = $SIZE(n);
+        if (len == 0) $CROAK("icfft: length 0");
+        cfft_plan plan = make_cfft_plan(len);
+        double *buf = (double *)malloc(2 * len * sizeof(double));
+        if (!plan || !buf) {
+            if (plan) destroy_cfft_plan(plan);
+            free(buf);
+            $CROAK("icfft: out of memory (length %td)", (ptrdiff_t)len);
+        }
+        int failed = 0;
+        broadcastloop %{
+            if (!failed) {
+                loop(n) %{ buf[2*n] = creal($x()); buf[2*n+1] = cimag($x()); %}
+                if (cfft_backward(plan, buf, 1.0 / (double)len) != 0) failed = 1;
+                else { loop(n) %{ $y() = buf[2*n] + I * buf[2*n+1]; %} }
+            }
+        %}
+        destroy_cfft_plan(plan);
+        free(buf);
+        if (failed) $CROAK("icfft: pocketfft failed (out of memory)");
+    },
+    Doc => <<'EOD',
+=for ref
+
+Inverse complex FFT along dim 0, scaled by 1/n. Can be used inplace.
+
+    $z = icfft($Z);
+EOD
+);
+
+# pocketfft's real transform stores its result as
+#   r0, r1, i1, r2, i2, ..., [r_{n/2} when n is even]
+# (FFTPACK order). rfft unpacks it into the n/2+1 non-negative frequencies.
+pp_def('rfft',
+    Pars => 'x(n); complex [o] y(m=CALC($SIZE(n)/2+1));',
+    GenericTypes => ['D'],
+    Code => q{
+        size_t len = $SIZE(n);
+        if (len == 0) $CROAK("rfft: length 0");
+        rfft_plan plan = make_rfft_plan(len);
+        double *buf = (double *)malloc(len * sizeof(double));
+        if (!plan || !buf) {
+            if (plan) destroy_rfft_plan(plan);
+            free(buf);
+            $CROAK("rfft: out of memory (length %td)", (ptrdiff_t)len);
+        }
+        int failed = 0;
+        broadcastloop %{
+            if (!failed) {
+                loop(n) %{ buf[n] = $x(); %}
+                if (rfft_forward(plan, buf, 1.0) != 0) failed = 1;
+                else {
+                    size_t k;
+                    $y(m=>0) = buf[0];
+                    for (k = 1; 2*k < len; k++)
+                        $y(m=>k) = buf[2*k-1] + I * buf[2*k];
+                    if (len % 2 == 0) $y(m=>len/2) = buf[len-1];
+                }
+            }
+        %}
+        destroy_rfft_plan(plan);
+        free(buf);
+        if (failed) $CROAK("rfft: pocketfft failed (out of memory)");
+    },
+    Doc => <<'EOD',
+=for ref
+
+Forward FFT of real input along dim 0, unscaled. Returns the n/2+1
+non-negative frequencies (integer division), as complex double.
+
+    $X = rfft($x);    # (n, ...) -> (n/2+1, ...)
+EOD
+);
+
+# irfft: the imaginary parts of the DC term (and of the Nyquist term when n is
+# even) are ignored, as in FFTW's c2r and numpy's irfft.
+pp_def('_irfft_int',
+    Pars => 'x(m); double [o] y(n);',
+    OtherPars => 'IV nout => n;',
+    GenericTypes => ['CD'],
+    RedoDimsCode => q{
+        if ($COMP(nout) < 1) $CROAK("irfft: output length must be at least 1");
+        if ($SIZE(m) != $COMP(nout) / 2 + 1)
+            $CROAK("irfft: input has %td frequencies, but output length %td needs %td",
+                   (ptrdiff_t)$SIZE(m), (ptrdiff_t)$COMP(nout), (ptrdiff_t)($COMP(nout) / 2 + 1));
+    },
+    Code => q{
+        size_t len = $SIZE(n);
+        rfft_plan plan = make_rfft_plan(len);
+        double *buf = (double *)malloc(len * sizeof(double));
+        if (!plan || !buf) {
+            if (plan) destroy_rfft_plan(plan);
+            free(buf);
+            $CROAK("irfft: out of memory (length %td)", (ptrdiff_t)len);
+        }
+        int failed = 0;
+        broadcastloop %{
+            if (!failed) {
+                size_t k;
+                buf[0] = creal($x(m=>0));
+                for (k = 1; 2*k < len; k++) {
+                    buf[2*k-1] = creal($x(m=>k));
+                    buf[2*k]   = cimag($x(m=>k));
+                }
+                if (len % 2 == 0) buf[len-1] = creal($x(m=>len/2));
+                if (rfft_backward(plan, buf, 1.0 / (double)len) != 0) failed = 1;
+                else { loop(n) %{ $y() = buf[n]; %} }
+            }
+        %}
+        destroy_rfft_plan(plan);
+        free(buf);
+        if (failed) $CROAK("irfft: pocketfft failed (out of memory)");
+    },
+    Doc => undef,
+);
+
+# _cfft_cols: complex FFT along dim 1 (n) of every column of x(b, n), in place.
+# Dim 0 (b) is a block of columns that lie next to each other in memory: they
+# are gathered together, row by row, into one buffer (b transforms of length
+# n), transformed, and scattered back, so memory is read and written in runs of
+# b elements instead of one element per stride. The Perl side cuts dim 0 of
+# the caller's ndarray into such blocks with splitdim, and the block index
+# becomes a broadcast dim, which PDL's auto-pthreading can split over threads.
+pp_def('_cfft_cols',
+    Pars => '[io] x(b,n);',
+    OtherPars => 'int inv;',
+    GenericTypes => ['CD'],
+    Code => q{
+        size_t len = $SIZE(n), nb = $SIZE(b), c;
+        cfft_plan plan = make_cfft_plan(len);
+        double *buf = (double *)malloc(2 * len * nb * sizeof(double));
+        if (!plan || !buf) {
+            if (plan) destroy_cfft_plan(plan);
+            free(buf);
+            $CROAK("cfftnd: out of memory (length %td, block %td)", (ptrdiff_t)len, (ptrdiff_t)nb);
+        }
+        double fct = $COMP(inv) ? 1.0 / (double)len : 1.0;
+        int failed = 0;
+        broadcastloop %{
+            if (!failed) {
+                loop(n) %{
+                    loop(b) %{
+                        double *p = buf + 2 * (b * len + n);
+                        p[0] = creal($x());
+                        p[1] = cimag($x());
+                    %}
+                %}
+                for (c = 0; c < nb && !failed; c++) {
+                    double *row = buf + 2 * c * len;
+                    if (($COMP(inv) ? cfft_backward(plan, row, fct) : cfft_forward(plan, row, fct)) != 0)
+                        failed = 1;
+                }
+                if (!failed) {
+                    loop(n) %{
+                        loop(b) %{
+                            double *p = buf + 2 * (b * len + n);
+                            $x() = p[0] + I * p[1];
+                        %}
+                    %}
+                }
+            }
+        %}
+        destroy_cfft_plan(plan);
+        free(buf);
+        if (failed) $CROAK("cfftnd: pocketfft failed (out of memory)");
+    },
+    Doc => undef,
+);
+
+pp_addpm(<<'EOD');
+
+=head2 irfft
+
+=for ref
+
+Inverse of L</rfft>: complex (m, ...) -> real (n, ...), scaled by 1/n. The
+output length n must satisfy m == n/2+1; it defaults to 2*(m-1), so pass it
+when n is odd. The imaginary parts of the zero-frequency term (and of the
+n/2 term when n is even) are ignored.
+
+    $x = irfft($X, $n);
+
+=cut
+
+sub irfft {
+    my ($X, $n) = @_;
+    $n = 2 * ($X->dim(0) - 1) unless defined $n;
+    return _irfft_int($X, $n);
+}
+
+=head2 fft_inplace, ifft_inplace
+
+=for ref
+
+Complex FFT of a real part and an imaginary part, in place, with the
+conventions of PDL::FFT::fft and PDL::FFT::ifft (forward unscaled, inverse
+scaled by 1/n). Both must have the same dims.
+
+    fft_inplace($re, $im);
+    ifft_inplace($re, $im);
+
+=cut
+
+sub fft_inplace  { _reim(@_, 0) }
+sub ifft_inplace { _reim(@_, 1) }
+
+sub _reim {
+    my ($re, $im, $inv) = @_;
+    Carp::croak("fft_inplace: re and im must have the same dims")
+        unless join(',', $re->dims) eq join(',', $im->dims);
+    my $z = PDL::czip($re, $im);
+    $z = $inv ? icfft($z) : cfft($z);
+    $re .= $z->re;
+    $im .= $z->im;
+    return;
+}
+
+=head2 cfftnd, icfftnd, rfftnd, irfftnd
+
+=for ref
+
+FFT over the first C<$rank> dims, broadcasting over the rest (the calling
+convention of PDL::FFTW3's C<fftn>, C<ifftn>, C<rfftn>, C<irfftn>; the names
+differ so that both modules can be imported together). The
+inverse transforms are scaled by 1/(n0*n1*...).
+
+    $Z  = cfftnd($z, 2);          # complex (n0, n1, ...) -> complex
+    $z2 = icfftnd($Z, 2);
+    $X  = rfftnd($x, 3);          # real (n0, n1, n2, ...) -> complex (n0/2+1, n1, n2, ...)
+    $x2 = irfftnd($X, 3, $n0);    # $n0 defaults to 2*(dim 0 - 1); pass it when n0 is odd
+    $z->inplace->cfftnd(2);       # in place (cdouble input), no new array allocated
+
+Dim 0 is transformed with L</cfft> (or L</rfft>). Each further dim d is
+transformed in place on the view C<mv(d, 1)>, without copying the array: the
+contiguous dim 0 of that view is cut into blocks of
+C<$PDL::PocketFFT::BLOCK> columns (default 16) with C<splitdim>, each block is
+transformed as a unit, and the block index is a broadcast dim, so PDL's
+auto-pthreading splits the blocks over threads.
+
+=cut
+
+our $BLOCK = 16;
+
+sub _check_rank {
+    my ($x, $rank, $name) = @_;
+    Carp::croak("$name: rank must be given") unless defined $rank;
+    Carp::croak("$name: rank must be between 1 and " . $x->ndims . ", not $rank")
+        unless $rank == int($rank) && $rank >= 1 && $rank <= $x->ndims;
+}
+
+# _cols_pass($y, $d, $inv): complex transform of $y (cdouble) along dim $d >= 1, in place
+sub _cols_pass {
+    my ($y, $d, $inv) = @_;
+    return if $y->dim($d) == 1;
+    my $v = $y->mv($d, 1);                       # (M, n, ...), dim 0 contiguous
+    my $M = $v->dim(0);
+    my $B = $BLOCK < 1 ? 1 : int($BLOCK);
+    $B = $M if $B > $M;
+    my $Mmain = $M - $M % $B;
+    _cfft_cols($v->slice('0:' . ($Mmain - 1))->splitdim(0, $B)->mv(1, 2), $inv);   # (B, n, M/B, ...)
+    _cfft_cols($v->slice($Mmain . ':' . ($M - 1)), $inv) if $Mmain < $M;          # tail (M % B, n, ...)
+    return;
+}
+
+# $x->inplace->cfftnd($rank): transform $x itself when it is cdouble (no new
+# array is allocated); otherwise a new array is returned
+sub _first_pass {
+    my ($x, $inv) = @_;
+    if ($x->is_inplace) {
+        $x->set_inplace(0);
+        if ($x->type == PDL::cdouble()) {
+            $inv ? $x->inplace->icfft : $x->inplace->cfft;
+            return $x;
+        }
+    }
+    return $inv ? icfft($x) : cfft($x);
+}
+
+sub cfftnd {
+    my ($x, $rank) = @_;
+    _check_rank($x, $rank, 'cfftnd');
+    my $y = _first_pass($x, 0);
+    _cols_pass($y, $_, 0) for 1 .. $rank - 1;
+    return $y;
+}
+
+sub icfftnd {
+    my ($x, $rank) = @_;
+    _check_rank($x, $rank, 'icfftnd');
+    my $y = _first_pass($x, 1);
+    _cols_pass($y, $_, 1) for 1 .. $rank - 1;
+    return $y;
+}
+
+sub rfftnd {
+    my ($x, $rank) = @_;
+    _check_rank($x, $rank, 'rfftnd');
+    my $y = rfft($x);
+    _cols_pass($y, $_, 0) for 1 .. $rank - 1;
+    return $y;
+}
+
+sub irfftnd {
+    my ($X, $rank, $n0) = @_;
+    _check_rank($X, $rank, 'irfftnd');
+    my $y = $X->convert(cdouble)->copy;
+    _cols_pass($y, $_, 1) for reverse 1 .. $rank - 1;
+    return irfft($y, $n0);
+}
+
+# method forms ($z->cfftnd(2), $X->irfft($n), ...), as PP functions get them
+{
+    no strict 'refs';
+    *{"PDL::$_"} = \&{"PDL::PocketFFT::$_"} for qw(irfft cfftnd icfftnd rfftnd irfftnd);
+}
+
+EOD
+
+pp_add_exported('', 'irfft fft_inplace ifft_inplace cfftnd icfftnd rfftnd irfftnd');
+
+pp_addpm({At => 'Bot'}, <<'EOD');
+
+=head1 AUTHOR
+
+pocketfft: Martin Reinecke, Max-Planck-Society (see LICENSE.pocketfft).
+
+=cut
+
+EOD
+
+pp_done();

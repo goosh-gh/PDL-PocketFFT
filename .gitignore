@@ -1,0 +1,13 @@
+.DS_Store
+Makefile
+Makefile.old
+MYMETA.*
+pm_to_blib
+blib/
+*.o
+*.bs
+PocketFFT.c
+PocketFFT.pm
+PocketFFT.xs
+download/
+bench/results_*

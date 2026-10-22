@@ -1,0 +1,9 @@
+LICENSE.pocketfft
+MANIFEST
+Makefile.PL
+README.md
+pocketfft.h
+pocketfft.pd
+pocketfft_lib.c
+t/01-transforms.t
+t/02-nd.t
